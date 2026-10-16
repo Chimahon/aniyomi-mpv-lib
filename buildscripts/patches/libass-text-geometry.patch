@@ -1,0 +1,237 @@
+--- a/libass/ass.h
++++ b/libass/ass.h
+@@ -59,6 +59,33 @@
+  * The last bitmap row is not guaranteed to be padded up to stride size,
+  * e.g. in the worst case a bitmap has the size stride * (h - 1) + w.
+  */
++/** Optional text geometry from the same layout used to render a frame.
++ * Text uses Unicode code points; span offsets index that text. Bounds are
++ * screen pixels after glyph transformation, clipping and collision handling.
++ * A shaping cluster may cover more than one code point.
++ */
++typedef struct {
++    int start, end;
++    int x, y, w, h;
++} ASS_TextGeometrySpan;
++
++typedef struct {
++    long long start, duration;
++    int read_order, layer;
++    const uint32_t *text;
++    int text_length;
++    const ASS_TextGeometrySpan *spans;
++    int span_count;
++} ASS_TextGeometryEvent;
++
++/** Disabled by default. Enable before ass_render_frame(). */
++void ass_set_text_geometry(ASS_Renderer *renderer, int enabled);
++/** Visits the last rendered frame in painting order. Pointers are borrowed
++ * for the callback only; callers must synchronize access with rendering.
++ */
++void ass_visit_text_geometry(ASS_Renderer *renderer,
++    void (*visit)(void *, const ASS_TextGeometryEvent *), void *opaque);
++
+ typedef struct ass_image {
+     int w, h;                   // Bitmap width/height
+     int stride;                 // Bitmap stride
+--- a/libass/ass_render.h
++++ b/libass/ass_render.h
+@@ -86,6 +86,7 @@
+     int detect_collisions;
+     int shift_direction;
+     ASS_Event *event;
++    ASS_TextGeometryEvent geometry;
+ } EventImages;
+ 
+ typedef enum {
+@@ -125,6 +126,8 @@
+ // GlyphInfo and TextInfo are used for text centering and word-wrapping operations
+ typedef struct glyph_info {
+     unsigned symbol;
++    unsigned source_symbol;
++    int hit_x, hit_y, hit_w, hit_h;
+     bool skip;                  // skip glyph when layouting text
+     bool is_trimmed_whitespace;
+     ASS_Font *font;
+@@ -321,6 +324,7 @@
+ 
+     EventImages *eimg;          // temporary buffer for sorting rendered events
+     int eimg_size;              // allocated buffer size
++    int geometry_enabled, geometry_event_count;
+ 
+     // frame-global data
+     int width, height;          // screen dimensions (the whole frame from ass_set_frame_size)
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -191,6 +191,10 @@
+         ass_fontselect_free(render_priv->fontselect);
+     if (render_priv->ftlibrary)
+         FT_Done_FreeType(render_priv->ftlibrary);
++    for (int i = 0; i < render_priv->geometry_event_count; i++) {
++        free((void *) render_priv->eimg[i].geometry.text);
++        free((void *) render_priv->eimg[i].geometry.spans);
++    }
+     free(render_priv->eimg);
+ 
+     render_context_done(&render_priv->state);
+@@ -2118,6 +2122,7 @@
+ 
+         // Fill glyph information
+         info->symbol = code;
++        info->source_symbol = code;
+         info->font = state->font;
+         for (int i = 0; i < 4; i++)
+             info->c[i] = state->c[i];
+@@ -2545,6 +2550,31 @@
+             get_bitmap_glyph(state, info, &current_info->leftmost_x, &pos, &pos_o,
+                              &offset, !current_info->bitmap_count, flags);
+ 
++            // Capture individual glyph bounds before libass combines a run
++            // into bitmaps. These coordinates already include ASS transforms.
++            Bitmap *hit = info->bm ? info->bm : info->bm_o;
++            ASS_Vector hit_pos = info->bm ? pos : pos_o;
++            if (render_priv->geometry_enabled && hit && !info->drawing_text.str &&
++                (info->fade < 255) &&
++                (_a(info->c[0]) != 255 || _a(info->c[1]) != 255 ||
++                 _a(info->c[2]) != 255)) {
++                int ink_x0 = hit->w, ink_y0 = hit->h, ink_x1 = 0, ink_y1 = 0;
++                for (int y = 0; y < hit->h; y++) {
++                    for (int x = 0; x < hit->w; x++) {
++                        if (!hit->buffer[y * hit->stride + x]) continue;
++                        ink_x0 = FFMIN(ink_x0, x); ink_y0 = FFMIN(ink_y0, y);
++                        ink_x1 = FFMAX(ink_x1, x + 1); ink_y1 = FFMAX(ink_y1, y + 1);
++                    }
++                }
++                int x0 = FFMAX(hit_pos.x + hit->left + ink_x0, state->clip_x0);
++                int y0 = FFMAX(hit_pos.y + hit->top + ink_y0, state->clip_y0);
++                int x1 = FFMIN(hit_pos.x + hit->left + ink_x1, state->clip_x1);
++                int y1 = FFMIN(hit_pos.y + hit->top + ink_y1, state->clip_y1);
++                info->hit_x = x0; info->hit_y = y0;
++                info->hit_w = FFMAX(x1 - x0, 0);
++                info->hit_h = FFMAX(y1 - y0, 0);
++            }
++
+             if (!info->bm && !info->bm_o)
+                 continue;
+ 
+@@ -2795,6 +2825,49 @@
+  * \param event_images struct containing resulting images, will also be initialized
+  * Process event, appending resulting ASS_Image's to images_root.
+  */
++// Snapshot layout-owned text before the next event reuses RenderContext.
++static void capture_text_geometry(RenderContext *state, EventImages *images)
++{
++    if (!state->renderer->geometry_enabled)
++        return;
++    TextInfo *text = &state->text_info;
++    uint32_t *symbols = calloc(text->length, sizeof(*symbols));
++    ASS_TextGeometrySpan *spans = calloc(text->length, sizeof(*spans));
++    if (!symbols || !spans) {
++        free(symbols); free(spans);
++        return;  // Geometry allocation must never affect rendering.
++    }
++    int count = 0;
++    for (int i = 0; i < text->length; i++) {
++        GlyphInfo *root = &text->glyphs[i];
++        symbols[i] = root->source_symbol;
++        if (root->skip || root->drawing_text.str)
++            continue;
++        int end = i + 1;
++        while (end < text->length && text->glyphs[end].skip &&
++               !text->glyphs[end].is_trimmed_whitespace &&
++               !text->glyphs[end].drawing_text.str &&
++               text->glyphs[end].source_symbol != '\n')
++            end++;
++        int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
++        for (GlyphInfo *g = root; g; g = g->next) {
++            if (g->hit_w <= 0 || g->hit_h <= 0)
++                continue;
++            x0 = FFMIN(x0, g->hit_x); y0 = FFMIN(y0, g->hit_y);
++            x1 = FFMAX(x1, g->hit_x + g->hit_w);
++            y1 = FFMAX(y1, g->hit_y + g->hit_h);
++        }
++        if (x1 > x0 && y1 > y0)
++            spans[count++] = (ASS_TextGeometrySpan) {i, end, x0, y0, x1-x0, y1-y0};
++    }
++    images->geometry = (ASS_TextGeometryEvent) {
++        .start = images->event->Start, .duration = images->event->Duration,
++        .read_order = images->event->ReadOrder, .layer = images->event->Layer,
++        .text = symbols, .text_length = text->length,
++        .spans = spans, .span_count = count,
++    };
++}
++
+ static bool
+ ass_render_event(RenderContext *state, ASS_Event *event,
+                  EventImages *event_images)
+@@ -3005,6 +3078,7 @@
+     event_images->shift_direction = (valign == VALIGN_SUB) ? -1 : 1;
+     event_images->event = event;
+     event_images->imgs = render_text(state);
++    capture_text_geometry(state, event_images);
+ 
+     if (state->border_style == 4)
+         add_background(state, event_images);
+@@ -3163,6 +3237,13 @@
+             cur->dst_y = 0;
+         }
+         cur = cur->next;
++    }
++    ASS_TextGeometrySpan *spans = (ASS_TextGeometrySpan *) ei->geometry.spans;
++    for (int i = 0; i < ei->geometry.span_count; i++) {
++        int top = FFMAX(spans[i].y + shift, 0);
++        int bottom = FFMIN(spans[i].y + spans[i].h + shift, render_priv->height);
++        spans[i].y = top;
++        spans[i].h = FFMAX(bottom - top, 0);
+     }
+     ei->top += shift;
+ }
+@@ -3370,6 +3451,12 @@
+ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
+                             long long now, int *detect_change)
+ {
++    for (int i = 0; i < priv->geometry_event_count; i++) {
++        free((void *) priv->eimg[i].geometry.text);
++        free((void *) priv->eimg[i].geometry.spans);
++        memset(&priv->eimg[i].geometry, 0, sizeof(priv->eimg[i].geometry));
++    }
++    priv->geometry_event_count = 0;
+     // init frame
+     if (!ass_start_frame(priv, track, now)) {
+         if (detect_change)
+@@ -3408,6 +3495,8 @@
+     if (cnt > 0)
+         fix_collisions(priv, last, priv->eimg + cnt - last);
+ 
++    priv->geometry_event_count = cnt;
++
+     // concat lists, removing fully transparent bitmaps
+     ASS_Image **tail = &priv->images_root;
+     for (int i = 0; i < cnt; i++) {
+@@ -3465,3 +3554,18 @@
+         img = ass_free_image(img);
+     } while (img);
+ }
++
++void ass_set_text_geometry(ASS_Renderer *renderer, int enabled)
++{
++    renderer->geometry_enabled = !!enabled;
++}
++
++void ass_visit_text_geometry(ASS_Renderer *renderer,
++    void (*visit)(void *, const ASS_TextGeometryEvent *), void *opaque)
++{
++    for (int i = 0; i < renderer->geometry_event_count; i++) {
++        const ASS_TextGeometryEvent *event = &renderer->eimg[i].geometry;
++        if (event->text && event->span_count > 0)
++            visit(opaque, event);
++    }
++}
+--- a/libass/libass.sym
++++ b/libass/libass.sym
+@@ -48,3 +48,5 @@
+ ass_free
+ ass_prune_events
+ ass_configure_prune
++ass_set_text_geometry
++ass_visit_text_geometry

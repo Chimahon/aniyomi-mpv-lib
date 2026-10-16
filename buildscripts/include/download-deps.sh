@@ -54,7 +54,15 @@ if [ ! -d unibreak ]; then
 fi
 
 # libass
-[ ! -d libass ] && git clone https://github.com/libass/libass.git --depth 1
+if [ ! -d libass ]; then
+	git clone https://github.com/libass/libass.git --no-checkout --filter=blob:none
+	git -C libass fetch --depth 1 origin "$v_libass"
+	git -C libass checkout --detach "$v_libass"
+fi
+[ "$(git -C libass rev-parse HEAD)" = "$v_libass" ] || {
+	echo >&2 "libass checkout does not match the pinned revision; use a clean deps directory"
+	exit 1
+}
 
 # lua
 if [ ! -d lua ]; then
@@ -76,5 +84,14 @@ if [ ! -d mpv ]; then
 	git checkout FETCH_HEAD
 	cd ..
 fi
+
+for library in libass mpv; do
+	patch_file="$(realpath ../patches/$library-text-geometry.patch)"
+	if git -C "$library" apply --reverse --check "$patch_file" 2>/dev/null; then
+		continue
+	fi
+	git -C "$library" apply --check "$patch_file"
+	git -C "$library" apply "$patch_file"
+done
 
 cd ..

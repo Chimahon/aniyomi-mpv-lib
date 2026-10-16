@@ -1,0 +1,229 @@
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -39,6 +39,19 @@
+     int num_entries;
+ };
+ 
++// All times are video-timeline seconds; string offsets are UTF-16 units.
++struct sub_text_span { int start, end, x, y, w, h; };
++struct sub_text_event {
++    char *text;
++    double start, end;
++    int id, layer, num_spans;
++    struct sub_text_span *spans;
++};
++struct sub_text_geometry {
++    int w, h, num_events;
++    struct sub_text_event *events;
++};
++
+ struct sub_line {
+     char *text;
+     double start;
+@@ -62,6 +75,8 @@
+ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+                                     int format, double pts);
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
++struct sub_text_geometry *sub_get_text_geometry(struct dec_sub *sub,
++    struct mp_osd_res dim, double pts);
+ char *sub_ass_get_extradata(struct dec_sub *sub);
+ struct sd_times sub_get_times(struct dec_sub *sub, double pts);
+ // Return subtitle lines in memory. Call talloc_free() on the return value.
+--- a/sub/sd.h
++++ b/sub/sd.h
+@@ -53,6 +53,8 @@
+     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
+     struct sd_times (*get_times)(struct sd *sd, double pts);
+     struct sub_lines *(*get_lines)(struct sd *sd);
++    struct sub_text_geometry *(*get_text_geometry)(struct sd *sd,
++        struct mp_osd_res dim, double pts);
+ };
+ 
+ // lavc_conv.c
+--- a/sub/dec_sub.c
++++ b/sub/dec_sub.c
+@@ -635,3 +635,20 @@
+     mp_mutex_unlock(&sub->lock);
+     return res;
+ }
++
++struct sub_text_geometry *sub_get_text_geometry(struct dec_sub *sub,
++    struct mp_osd_res dim, double pts)
++{
++    mp_mutex_lock(&sub->lock);
++    struct sub_text_geometry *geometry = NULL;
++    if (sub->sd->driver->get_text_geometry) {
++        geometry = sub->sd->driver->get_text_geometry(sub->sd, dim,
++            pts_to_subtitle(sub, pts));
++        for (int i = 0; geometry && i < geometry->num_events; i++) {
++            geometry->events[i].start = pts_from_subtitle(sub, geometry->events[i].start);
++            geometry->events[i].end = pts_from_subtitle(sub, geometry->events[i].end);
++        }
++    }
++    mp_mutex_unlock(&sub->lock);
++    return geometry;
++}
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -778,6 +778,7 @@
+         fill_plaintext(sd, pts);
+ 
+     int changed;
++    ass_set_text_geometry(renderer, 1);
+     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+     mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
+ 
+@@ -1101,6 +1102,66 @@
+     }
+ }
+ 
++static void append_text_geometry(void *opaque, const ASS_TextGeometryEvent *src)
++{
++    struct sub_text_geometry *geometry = opaque;
++    struct sub_text_event event = {
++        .id = src->read_order, .layer = src->layer,
++        .start = src->start / 1000.0, .end = (src->start + src->duration) / 1000.0,
++    };
++    int *offsets = talloc_array(NULL, int, src->text_length + 1);
++    bstr text = {0};
++    int offset = 0;
++    for (int i = 0; i < src->text_length; i++) {
++        unsigned cp = src->text[i];
++        offsets[i] = offset;
++        offset += cp > 0xFFFF ? 2 : 1;
++        char utf8[4];
++        int n;
++        if (cp < 0x80) { utf8[0] = cp; n = 1; }
++        else if (cp < 0x800) {
++            utf8[0] = 0xC0 | (cp >> 6); utf8[1] = 0x80 | (cp & 63); n = 2;
++        } else if (cp < 0x10000) {
++            utf8[0] = 0xE0 | (cp >> 12); utf8[1] = 0x80 | ((cp >> 6) & 63);
++            utf8[2] = 0x80 | (cp & 63); n = 3;
++        } else {
++            utf8[0] = 0xF0 | (cp >> 18); utf8[1] = 0x80 | ((cp >> 12) & 63);
++            utf8[2] = 0x80 | ((cp >> 6) & 63); utf8[3] = 0x80 | (cp & 63); n = 4;
++        }
++        bstr_xappend(NULL, &text, (bstr) {utf8, n});
++    }
++    offsets[src->text_length] = offset;
++    event.text = talloc_strndup(geometry, text.start ? text.start : "", text.len);
++    event.spans = talloc_array(geometry, struct sub_text_span, src->span_count);
++    for (int i = 0; i < src->span_count; i++) {
++        const ASS_TextGeometrySpan *span = &src->spans[i];
++        if (span->h <= 0 || span->w <= 0)
++            continue;
++        event.spans[event.num_spans++] = (struct sub_text_span) {
++            offsets[span->start], offsets[span->end], span->x, span->y, span->w, span->h,
++        };
++    }
++    MP_TARRAY_APPEND(geometry, geometry->events, geometry->num_events, event);
++    talloc_free(text.start);
++    talloc_free(offsets);
++}
++
++static struct sub_text_geometry *get_text_geometry(struct sd *sd,
++    struct mp_osd_res dim, double pts)
++{
++    struct sd_ass_priv *ctx = sd->priv;
++    if (!ctx->ass_renderer || dim.w <= 0 || dim.h <= 0 || pts == MP_NOPTS_VALUE)
++        return NULL;
++    // Render and snapshot while the decoder lock is held. Geometry and text
++    // therefore belong to exactly the same frame, including collision shifts.
++    struct sub_bitmaps *images = get_bitmaps(sd, dim, SUBBITMAP_LIBASS, pts);
++    talloc_free(images);
++    struct sub_text_geometry *geometry = talloc_zero(NULL, struct sub_text_geometry);
++    geometry->w = dim.w; geometry->h = dim.h;
++    ass_visit_text_geometry(ctx->ass_renderer, append_text_geometry, geometry);
++    return geometry;
++}
++
+ const struct sd_functions sd_ass = {
+     .name = "ass",
+     .accept_packets_in_advance = true,
+@@ -1110,6 +1171,7 @@
+     .get_text = get_text,
+     .get_times = get_times,
+     .get_lines = get_lines,
++    .get_text_geometry = get_text_geometry,
+     .control = control,
+     .reset = reset,
+     .select = enable_output,
+--- a/player/command.c
++++ b/player/command.c
+@@ -77,6 +77,7 @@
+ #include "misc/dispatch.h"
+ #include "misc/language.h"
+ #include "misc/node.h"
++#include "misc/json.h"
+ #include "misc/thread_pool.h"
+ #include "misc/thread_tools.h"
+ 
+@@ -3474,6 +3475,57 @@
+     return M_PROPERTY_NOT_IMPLEMENTED;
+ }
+ 
++static int mp_property_sub_text_geometry(void *ctx, struct m_property *prop,
++    int action, void *arg)
++{
++    if (action == M_PROPERTY_GET_TYPE) {
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
++        return M_PROPERTY_OK;
++    }
++    if (action != M_PROPERTY_GET)
++        return M_PROPERTY_NOT_IMPLEMENTED;
++    MPContext *mpctx = ctx;
++    int index = *(int *)prop->priv;
++    struct track *track = mpctx->current_track[index][STREAM_SUB];
++    struct dec_sub *sub = track ? track->d_sub : NULL;
++    if (!sub || mpctx->playback_pts == MP_NOPTS_VALUE)
++        return M_PROPERTY_UNAVAILABLE;
++    struct sub_text_geometry *geometry = sub_get_text_geometry(sub,
++        osd_get_vo_res(mpctx->osd), mpctx->playback_pts);
++    if (!geometry)
++        return M_PROPERTY_UNAVAILABLE;
++    struct mpv_node root;
++    node_init(&root, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_int64(&root, "version", 1);
++    node_map_add_int64(&root, "w", geometry->w);
++    node_map_add_int64(&root, "h", geometry->h);
++    struct mpv_node *events = node_map_add(&root, "events", MPV_FORMAT_NODE_ARRAY);
++    for (int i = 0; i < geometry->num_events; i++) {
++        struct sub_text_event *src = &geometry->events[i];
++        struct mpv_node *event = node_array_add(events, MPV_FORMAT_NODE_MAP);
++        node_map_add_string(event, "text", src->text);
++        node_map_add_int64(event, "id", src->id);
++        node_map_add_double(event, "start", src->start);
++        node_map_add_double(event, "end", src->end);
++        struct mpv_node *spans = node_map_add(event, "spans", MPV_FORMAT_NODE_ARRAY);
++        for (int j = 0; j < src->num_spans; j++) {
++            struct sub_text_span *s = &src->spans[j];
++            struct mpv_node *span = node_array_add(spans, MPV_FORMAT_NODE_MAP);
++            node_map_add_int64(span, "start", s->start);
++            node_map_add_int64(span, "end", s->end);
++            node_map_add_int64(span, "x", s->x); node_map_add_int64(span, "y", s->y);
++            node_map_add_int64(span, "w", s->w); node_map_add_int64(span, "h", s->h);
++        }
++    }
++    char *json = NULL;
++    int result = json_write(&json, &root);
++    talloc_free(root.u.list);
++    talloc_free(geometry);
++    if (result < 0) { talloc_free(json); return M_PROPERTY_ERROR; }
++    *(char **)arg = json;
++    return M_PROPERTY_OK;
++}
++
+ static struct sd_times get_times(void *ctx, struct m_property *prop,
+                                 int action, void *arg)
+ {
+@@ -4761,6 +4813,10 @@
+     {"secondary-sub-text", mp_property_sub_text,
+         .priv = (void *)&(const int[]){1, SD_TEXT_TYPE_PLAIN}},
+     M_PROPERTY_DEPRECATED_ALIAS("sub-text-ass", "sub-text/ass"),
++    {"sub-text-geometry", mp_property_sub_text_geometry,
++        .priv = (void *)&(const int){0}},
++    {"secondary-sub-text-geometry", mp_property_sub_text_geometry,
++        .priv = (void *)&(const int){1}},
+     {"sub-start", mp_property_sub_start,
+         .priv = (void *)&(const int){0}},
+     {"secondary-sub-start", mp_property_sub_start,

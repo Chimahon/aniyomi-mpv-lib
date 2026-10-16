@@ -14,6 +14,7 @@ v_unibreak=6.1
 v_harfbuzz=10.1.0
 v_fribidi=1.0.16
 v_freetype=2-13-3
+v_libass=f61db567e6593df3470e91594bcd4ad2d0473aff
 v_mbedtls=3.6.2
 v_libxml2=2.13.5
 v_ffmpeg=n8.1.2
