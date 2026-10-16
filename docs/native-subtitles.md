@@ -18,3 +18,14 @@ image-only subtitles have no selectable text.
 The decoder snapshots geometry under its existing lock. Callers own the
 returned snapshot. Timing is converted to the video timeline once, inside
 MPV; applications must not apply subtitle delay or speed a second time.
+
+Geometry is collected only when requested, rather than on every video frame.
+
+`MPVLib.setSubtitleTextFilter` accepts a thread-safe deletion/whitespace filter.
+The existing app regex implementation runs before libass shapes and positions
+text, preserving styling on retained characters. Drawings bypass the text
+filter. Returning null leaves text unchanged; an empty result hides the event.
+Invalid mappings and Java exceptions leave playback and the original text intact.
+Callbacks must never call MPV APIs. Set `sub-text-filter-refresh` to true after
+changing filter settings to redraw a paused frame. The bridge clears its filter
+reference when the player is destroyed.

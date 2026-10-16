@@ -65,15 +65,24 @@
 +}
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
-@@ -778,6 +778,7 @@
+@@ -31,6 +31,7 @@
+ #include "options/options.h"
+ #include "options/path.h"
+ #include "common/common.h"
++#include "common/global.h"
+ #include "common/msg.h"
+ #include "demux/demux.h"
+ #include "demux/packet_pool.h"
+@@ -778,6 +779,8 @@
          fill_plaintext(sd, pts);
  
      int changed;
-+    ass_set_text_geometry(renderer, 1);
++    ass_set_text_filter(renderer, sd->global->subtitle_text_filter,
++                        sd->global->subtitle_text_filter_opaque);
      ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
      mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
  
-@@ -1101,6 +1102,66 @@
+@@ -1101,6 +1104,69 @@
      }
  }
  
@@ -125,22 +134,25 @@
 +    struct mp_osd_res dim, double pts)
 +{
 +    struct sd_ass_priv *ctx = sd->priv;
-+    if (!ctx->ass_renderer || dim.w <= 0 || dim.h <= 0 || pts == MP_NOPTS_VALUE)
++    if (!ctx->ass_renderer || sd->opts->sub_forced_events_only ||
++        dim.w <= 0 || dim.h <= 0 || pts == MP_NOPTS_VALUE)
 +        return NULL;
 +    // Render and snapshot while the decoder lock is held. Geometry and text
 +    // therefore belong to exactly the same frame, including collision shifts.
++    ass_set_text_geometry(ctx->ass_renderer, 1);
 +    struct sub_bitmaps *images = get_bitmaps(sd, dim, SUBBITMAP_LIBASS, pts);
 +    talloc_free(images);
 +    struct sub_text_geometry *geometry = talloc_zero(NULL, struct sub_text_geometry);
 +    geometry->w = dim.w; geometry->h = dim.h;
 +    ass_visit_text_geometry(ctx->ass_renderer, append_text_geometry, geometry);
++    ass_set_text_geometry(ctx->ass_renderer, 0);
 +    return geometry;
 +}
 +
  const struct sd_functions sd_ass = {
      .name = "ass",
      .accept_packets_in_advance = true,
-@@ -1110,6 +1171,7 @@
+@@ -1110,6 +1176,7 @@
      .get_text = get_text,
      .get_times = get_times,
      .get_lines = get_lines,
@@ -158,10 +170,29 @@
  #include "misc/thread_pool.h"
  #include "misc/thread_tools.h"
  
-@@ -3474,6 +3475,57 @@
+@@ -3474,6 +3475,76 @@
      return M_PROPERTY_NOT_IMPLEMENTED;
  }
  
++static int mp_property_sub_text_filter_refresh(void *ctx, struct m_property *prop,
++    int action, void *arg)
++{
++    if (action == M_PROPERTY_GET_TYPE) {
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_BOOL};
++        return M_PROPERTY_OK;
++    }
++    if (action == M_PROPERTY_GET) {
++        *(bool *)arg = false;
++        return M_PROPERTY_OK;
++    }
++    if (action == M_PROPERTY_SET) {
++        MPContext *mpctx = ctx;
++        osd_changed(mpctx->osd);
++        return M_PROPERTY_OK;
++    }
++    return M_PROPERTY_NOT_IMPLEMENTED;
++}
++
 +static int mp_property_sub_text_geometry(void *ctx, struct m_property *prop,
 +    int action, void *arg)
 +{
@@ -216,10 +247,11 @@
  static struct sd_times get_times(void *ctx, struct m_property *prop,
                                  int action, void *arg)
  {
-@@ -4761,6 +4813,10 @@
+@@ -4761,6 +4832,11 @@
      {"secondary-sub-text", mp_property_sub_text,
          .priv = (void *)&(const int[]){1, SD_TEXT_TYPE_PLAIN}},
      M_PROPERTY_DEPRECATED_ALIAS("sub-text-ass", "sub-text/ass"),
++    {"sub-text-filter-refresh", mp_property_sub_text_filter_refresh},
 +    {"sub-text-geometry", mp_property_sub_text_geometry,
 +        .priv = (void *)&(const int){0}},
 +    {"secondary-sub-text-geometry", mp_property_sub_text_geometry,
@@ -227,3 +259,50 @@
      {"sub-start", mp_property_sub_start,
          .priv = (void *)&(const int){0}},
      {"secondary-sub-start", mp_property_sub_start,
+--- a/common/global.h
++++ b/common/global.h
+@@ -4,7 +4,12 @@
+ // This should be accessed by glue code only, never normal code.
+ // The only purpose of this is to make mpv library-safe.
+ // Think hard before adding new members.
++#include <stdint.h>
++
+ struct mpv_global {
++    // Immutable after mpv_initialize(). Callback must not call back into mpv.
++    int (*subtitle_text_filter)(void *, const uint32_t *, int, uint32_t *);
++    void *subtitle_text_filter_opaque;
+     struct mp_log *log;
+     struct m_config_shadow *config;
+     struct mp_client_api *client_api;
+--- a/include/mpv/client.h
++++ b/include/mpv/client.h
+@@ -1733,6 +1733,14 @@
+  * Safe to be called from mpv render API threads.
+  */
+ MPV_EXPORT void mpv_wakeup(mpv_handle *ctx);
++
++/** Chimahon extension. Register before mpv_initialize(). The callback runs on
++ * subtitle rendering threads and MUST NOT call mpv APIs. It may delete Unicode
++ * codepoints or normalize whitespace; output capacity is length codepoints.
++ * Return -1 to keep input unchanged. The opaque pointer must outlive the player.
++ */
++MPV_EXPORT void mpv_set_subtitle_text_filter(mpv_handle *ctx,
++    int (*filter)(void *, const uint32_t *, int, uint32_t *), void *opaque);
+ 
+ /**
+  * Set a custom function that should be called when there are new events. Use
+--- a/player/client.c
++++ b/player/client.c
+@@ -2247,3 +2247,12 @@
+     mp_mutex_unlock(&clients->lock);
+     return found;
+ }
++
++void mpv_set_subtitle_text_filter(mpv_handle *ctx,
++    int (*filter)(void *, const uint32_t *, int, uint32_t *), void *opaque)
++{
++    // Only the creating client may configure the filter before initialization.
++    assert(!ctx->mpctx->initialized);
++    ctx->mpctx->global->subtitle_text_filter = filter;
++    ctx->mpctx->global->subtitle_text_filter_opaque = opaque;
++}

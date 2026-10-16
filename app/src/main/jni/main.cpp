@@ -4,6 +4,8 @@
 #include <time.h>
 #include <locale.h>
 #include <atomic>
+#include <vector>
+#include <limits.h>
 
 #include <mpv/client.h>
 
@@ -33,6 +35,59 @@ std::atomic<bool> g_event_thread_request_exit(false);
 
 static pthread_t event_thread_id;
 
+// Unicode crosses JNI as UTF-16, never JNI's modified UTF-8. Keep this callback
+// independent of the event observer lock; rendering may run on a decoder thread.
+static int filter_subtitle_text(void *, const uint32_t *input, int length, uint32_t *output) {
+    if (length < 0 || length > INT_MAX / 2)
+        return -1;
+    JNIEnv *env = nullptr;
+    bool attached = g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) == JNI_EDETACHED;
+    if (!acquire_jni_env(g_vm, &env))
+        return -1;
+    int count = -1;
+    if (env->PushLocalFrame(4) == JNI_OK) {
+        std::vector<jchar> text;
+        text.reserve(length * 2);
+        for (int i = 0; i < length; i++) {
+            uint32_t cp = input[i];
+            if (cp > 0xFFFF) {
+                text.push_back(0xD800 + ((cp - 0x10000) >> 10));
+                text.push_back(0xDC00 + ((cp - 0x10000) & 1023));
+            } else {
+                text.push_back(cp);
+            }
+        }
+        jstring original = env->NewString(text.data(), text.size());
+        jstring filtered = original ? static_cast<jstring>(env->CallStaticObjectMethod(
+            mpv_MPVLib, mpv_MPVLib_filterSubtitleText, original)) : nullptr;
+        if (!env->ExceptionCheck() && filtered) {
+            int size = env->GetStringLength(filtered);
+            const jchar *chars = env->GetStringChars(filtered, nullptr);
+            if (chars) {
+                count = 0;
+                for (int i = 0; i < size; i++) {
+                    uint32_t cp = chars[i];
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < size &&
+                        chars[i + 1] >= 0xDC00 && chars[i + 1] <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + chars[++i] - 0xDC00;
+                    }
+                    if (count == length) { count = -1; break; }
+                    output[count++] = cp;
+                }
+                env->ReleaseStringChars(filtered, chars);
+            }
+        }
+        env->PopLocalFrame(nullptr);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        count = -1; // A filter failure must not break playback.
+    }
+    if (attached)
+        g_vm->DetachCurrentThread();
+    return count;
+}
+
 static void prepare_environment(JNIEnv *env, jobject appctx) {
     setlocale(LC_NUMERIC, "C");
 
@@ -54,6 +109,8 @@ jni_func(void, create, jobject appctx, jstring log_lvl) {
         die("context init failed");
         return;
     }
+
+    mpv_set_subtitle_text_filter(g_mpv, filter_subtitle_text, nullptr);
 
     const char *log_lvl_string = env->GetStringUTFChars(log_lvl, 0);
     mpv_request_log_messages(g_mpv, log_lvl_string);
@@ -92,6 +149,9 @@ jni_func(void, destroy) {
 
     mpv_terminate_destroy(g_mpv);
     g_mpv = NULL;
+    jfieldID filter = env->GetStaticFieldID(mpv_MPVLib, "subtitleTextFilter", "Lis/xyz/mpv/MPVLib$SubtitleTextFilter;");
+    if (filter)
+        env->SetStaticObjectField(mpv_MPVLib, filter, nullptr);
 }
 
 jni_func(void, command, jobjectArray jarray) {

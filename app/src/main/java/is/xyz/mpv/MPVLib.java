@@ -28,6 +28,23 @@ public class MPVLib {
 
      public static native void command(@NonNull String[] cmd);
 
+     /** Runs on native subtitle rendering threads. Implementations must not call MPV APIs. */
+     public interface SubtitleTextFilter {
+          // Return null to leave the text unchanged.
+          String filter(String text);
+     }
+
+     private static volatile SubtitleTextFilter subtitleTextFilter;
+
+     public static void setSubtitleTextFilter(SubtitleTextFilter filter) {
+          subtitleTextFilter = filter;
+     }
+
+     public static String filterSubtitleText(String text) {
+          SubtitleTextFilter filter = subtitleTextFilter;
+          return filter == null ? null : filter.filter(text);
+     }
+
      public static native int setOptionString(@NonNull String name, @NonNull String value);
 
      public static native Bitmap grabThumbnail(int dimension);

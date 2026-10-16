@@ -1,6 +1,6 @@
 --- a/libass/ass.h
 +++ b/libass/ass.h
-@@ -59,6 +59,33 @@
+@@ -59,6 +59,39 @@
   * The last bitmap row is not guaranteed to be padded up to stride size,
   * e.g. in the worst case a bitmap has the size stride * (h - 1) + w.
   */
@@ -31,6 +31,12 @@
 +void ass_visit_text_geometry(ASS_Renderer *renderer,
 +    void (*visit)(void *, const ASS_TextGeometryEvent *), void *opaque);
 +
++/** Optional deletion/whitespace filter. output has room for length codepoints.
++ * Return -1 for unchanged or a length in [0, length]. Retained characters keep
++ * their ASS styling. Drawings bypass this text-only filter. */
++void ass_set_text_filter(ASS_Renderer *renderer,
++    int (*filter)(void *, const uint32_t *, int, uint32_t *), void *opaque);
++
  typedef struct ass_image {
      int w, h;                   // Bitmap width/height
      int stride;                 // Bitmap stride
@@ -53,11 +59,13 @@
      bool skip;                  // skip glyph when layouting text
      bool is_trimmed_whitespace;
      ASS_Font *font;
-@@ -321,6 +324,7 @@
+@@ -321,6 +324,9 @@
  
      EventImages *eimg;          // temporary buffer for sorting rendered events
      int eimg_size;              // allocated buffer size
 +    int geometry_enabled, geometry_event_count;
++    int (*text_filter)(void *, const uint32_t *, int, uint32_t *);
++    void *text_filter_opaque;
  
      // frame-global data
      int width, height;          // screen dimensions (the whole frame from ass_set_frame_size)
@@ -114,7 +122,7 @@
              if (!info->bm && !info->bm_o)
                  continue;
  
-@@ -2795,6 +2825,49 @@
+@@ -2795,6 +2825,92 @@
   * \param event_images struct containing resulting images, will also be initialized
   * Process event, appending resulting ASS_Image's to images_root.
   */
@@ -161,10 +169,61 @@
 +    };
 +}
 +
++static void filter_event_text(RenderContext *state)
++{
++    ASS_Renderer *renderer = state->renderer;
++    TextInfo *text = &state->text_info;
++    int length = text->length;
++    if (!renderer->text_filter || !length)
++        return;
++    // ASS drawings are not text, and must retain their exact drawing runs.
++    for (int i = 0; i < length; i++)
++        if (text->glyphs[i].drawing_text.str)
++            return;
++    uint32_t *input = calloc(length, sizeof(*input));
++    uint32_t *output = calloc(length, sizeof(*output));
++    int *indices = calloc(length, sizeof(*indices));
++    if (!input || !output || !indices)
++        goto done;
++    for (int i = 0; i < length; i++)
++        input[i] = text->glyphs[i].symbol;
++    int count = renderer->text_filter(renderer->text_filter_opaque, input, length, output);
++    if (count < 0 || count > length)
++        goto done;
++    // Only deletion and whitespace normalization are supported. Validate the
++    // entire mapping before touching glyphs; malformed output leaves ASS intact.
++    int source = 0;
++    for (int i = 0; i < count; i++) {
++        while (source < length && input[source] != output[i] &&
++               !(output[i] == ' ' && (input[source] == '\n' ||
++                 input[source] == '\t' || input[source] == 0xA0)))
++            source++;
++        if (source == length)
++            goto done;
++        indices[i] = source++;
++    }
++    for (int i = 0; i < count; i++) {
++        text->glyphs[i] = text->glyphs[indices[i]];
++        text->glyphs[i].symbol = output[i];
++        text->glyphs[i].source_symbol = output[i];
++    }
++    text->length = count;
++done:
++    free(input); free(output); free(indices);
++}
++
  static bool
  ass_render_event(RenderContext *state, ASS_Event *event,
                   EventImages *event_images)
-@@ -3005,6 +3078,7 @@
+@@ -2815,6 +2931,7 @@
+     if (!parse_events(state, event))
+         return false;
+ 
++    filter_event_text(state);
+     TextInfo *text_info = &state->text_info;
+     if (text_info->length == 0) {
+         // no valid symbols in the event; this can be smth like {comment}
+@@ -3005,6 +3122,7 @@
      event_images->shift_direction = (valign == VALIGN_SUB) ? -1 : 1;
      event_images->event = event;
      event_images->imgs = render_text(state);
@@ -172,7 +231,7 @@
  
      if (state->border_style == 4)
          add_background(state, event_images);
-@@ -3163,6 +3237,13 @@
+@@ -3163,6 +3281,13 @@
              cur->dst_y = 0;
          }
          cur = cur->next;
@@ -186,7 +245,7 @@
      }
      ei->top += shift;
  }
-@@ -3370,6 +3451,12 @@
+@@ -3370,6 +3495,12 @@
  ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                              long long now, int *detect_change)
  {
@@ -199,7 +258,7 @@
      // init frame
      if (!ass_start_frame(priv, track, now)) {
          if (detect_change)
-@@ -3408,6 +3495,8 @@
+@@ -3408,6 +3539,8 @@
      if (cnt > 0)
          fix_collisions(priv, last, priv->eimg + cnt - last);
  
@@ -208,7 +267,7 @@
      // concat lists, removing fully transparent bitmaps
      ASS_Image **tail = &priv->images_root;
      for (int i = 0; i < cnt; i++) {
-@@ -3465,3 +3554,18 @@
+@@ -3465,3 +3598,25 @@
          img = ass_free_image(img);
      } while (img);
  }
@@ -227,11 +286,19 @@
 +            visit(opaque, event);
 +    }
 +}
++
++void ass_set_text_filter(ASS_Renderer *renderer,
++    int (*filter)(void *, const uint32_t *, int, uint32_t *), void *opaque)
++{
++    renderer->text_filter = filter;
++    renderer->text_filter_opaque = opaque;
++}
 --- a/libass/libass.sym
 +++ b/libass/libass.sym
-@@ -48,3 +48,5 @@
+@@ -48,3 +48,6 @@
  ass_free
  ass_prune_events
  ass_configure_prune
 +ass_set_text_geometry
 +ass_visit_text_geometry
++ass_set_text_filter
