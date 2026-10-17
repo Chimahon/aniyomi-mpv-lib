@@ -1,0 +1,23 @@
+plugins {
+    id 'maven-publish'
+}
+
+group = 'com.github.sohilsayed'
+version = System.getenv('RELEASE_VERSION') ?: 'local'
+
+tasks.register('sourceJar', Jar) {
+    archiveFileName = "aniyomi-mpv-lib-${project.version}-sources.jar"
+    destinationDirectory = layout.buildDirectory.dir('libs')
+    archiveClassifier = 'sources'
+    from '../app/src/main/java'
+}
+
+publishing {
+    publications {
+        library(MavenPublication) {
+            artifactId = 'aniyomi-mpv-lib'
+            artifact('../app/build/outputs/aar/aniyomi-mpv-lib-release.aar')
+            artifact(tasks.named('sourceJar'))
+        }
+    }
+}

@@ -9,4 +9,4 @@ before_install:
 install:
   # JitPack runs a single shell for each list entry; chain with && so a missing
   # or empty AAR fails the build instead of publishing a 0-byte artifact.
-  - test -s app/build/outputs/aar/aniyomi-mpv-lib-release.aar && test $(stat -c%s app/build/outputs/aar/aniyomi-mpv-lib-release.aar) -gt 1000000 && ./gradlew app:publishBarPublicationToMavenLocal
+  - test -s app/build/outputs/aar/aniyomi-mpv-lib-release.aar && test $(stat -c%s app/build/outputs/aar/aniyomi-mpv-lib-release.aar) -gt 1000000 && ./gradlew -p publishing publishToMavenLocal
