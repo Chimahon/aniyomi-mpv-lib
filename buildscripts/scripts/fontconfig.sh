@@ -25,3 +25,5 @@ cd "$build"
 
 make -j$cores
 make DESTDIR="$prefix_dir" install
+# Use pkg-config for dependencies instead of libtool's unstaged /usr/local paths.
+rm -f "$prefix_dir/lib/libfontconfig.la"

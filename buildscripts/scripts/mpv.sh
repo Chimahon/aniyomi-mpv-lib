@@ -15,6 +15,9 @@ fi
 
 unset CC CXX # meson wants these unset
 
+# Static Fontconfig needs libxml2, which pkg-config lists as a private dependency.
+export LDFLAGS="$LDFLAGS $(pkg-config --libs libxml-2.0)"
+
 meson setup $build --cross-file "$prefix_dir"/crossfile.txt \
 	--default-library shared \
 	-Diconv=disabled -Dlua=enabled \
