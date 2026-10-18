@@ -22,7 +22,7 @@ extra=
 ../configure \
 	--host=$ndk_triple $extra \
 	--enable-static --disable-shared \
-	--enable-libunibreak --disable-require-system-font-provider \
+	--enable-libunibreak --enable-fontconfig \
 	--with-pic
 
 make -j$cores

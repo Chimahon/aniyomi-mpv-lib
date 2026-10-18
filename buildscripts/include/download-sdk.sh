@@ -10,11 +10,11 @@
 if [ "$os" == "linux" ]; then
 	if [ $IN_CI -eq 0 ]; then
 		if hash yum &>/dev/null; then
-			sudo yum install autoconf pkgconfig libtool ninja-build \
-				python3-pip python3-setuptools python3-jsonschema unzip wget nasm meson
+			sudo yum install -y autoconf pkgconfig libtool ninja-build \
+				python3-pip python3-setuptools python3-jsonschema unzip wget nasm meson gperf
 		elif apt-get -v &>/dev/null; then
-			sudo apt-get install autoconf pkg-config libtool ninja-build \
-				python3-pip python3-setuptools python3-jsonschema unzip nasm wget meson
+			sudo apt-get install -y autoconf pkg-config libtool ninja-build \
+				python3-pip python3-setuptools python3-jsonschema unzip nasm wget meson gperf
 		else
 			echo "Note: dependencies were not installed, you have to do that manually."
 		fi
@@ -38,7 +38,7 @@ elif [ "$os" == "mac" ]; then
 		fi
 		brew install \
 			automake autoconf libtool pkg-config \
-			coreutils gnu-sed wget meson ninja
+			coreutils gnu-sed wget meson ninja gperf
 	fi
 	if ! javac -version &>/dev/null; then
 		echo "Error: missing Java Development Kit. Install it manually."

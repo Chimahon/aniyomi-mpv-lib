@@ -53,6 +53,14 @@ if [ ! -d unibreak ]; then
 		tar -xz -C unibreak --strip-components=1
 fi
 
+# fontconfig
+# Fontconfig uses the libxml2 dependency already built for FFmpeg.
+if [ ! -d fontconfig ]; then
+	mkdir fontconfig
+	$WGET https://www.freedesktop.org/software/fontconfig/release/fontconfig-${v_fontconfig}.tar.xz -O - | \
+		tar -xJ -C fontconfig --strip-components=1
+fi
+
 # libass
 if [ ! -d libass ]; then
 	git clone https://github.com/libass/libass.git --no-checkout --filter=blob:none
